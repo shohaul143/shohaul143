@@ -1,0 +1,147 @@
+name: Refresh profile stats
+
+on:
+  schedule:
+    - cron: '45 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute stats and splice into README
+        env:
+          GH_TOKEN: ${{ secrets.PROFILE_PAT }}
+          ME: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # GraphQL requires auth, so this first call fails the job loudly
+          # when the PROFILE_PAT secret is missing or invalid.
+          user_id=$(gh api graphql \
+            -f query='query($login: String!) { user(login: $login) { id } }' \
+            -f login="$ME" --jq '.data.user.id')
+          created=$(gh api users/"$ME" --jq '.created_at')
+
+          repos_json=$(gh api "user/repos?affiliation=owner&per_page=100")
+          total=$(jq 'length' <<<"$repos_json")
+          priv=$(jq '[.[] | select(.private)] | length' <<<"$repos_json")
+          pub=$((total - priv))
+
+          # One walk per owned repo over default-branch history, author-filtered:
+          # every repo counts commits; non-fork repos also feed the LOC totals.
+          loc_query='query($owner: String!, $name: String!, $id: ID!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              defaultBranchRef {
+                target {
+                  ... on Commit {
+                    history(first: 100, after: $cursor, author: { id: $id }) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { additions deletions }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+          commits=0
+          adds=0
+          dels=0
+          while read -r is_fork full_name; do
+            [ -n "$full_name" ] || continue
+            owner=${full_name%%/*}
+            name=${full_name##*/}
+            cursor=""
+            while :; do
+              args=(-F owner="$owner" -F name="$name" -F id="$user_id")
+              if [ -n "$cursor" ]; then
+                args+=(-F cursor="$cursor")
+              fi
+              resp=$(gh api graphql -f query="$loc_query" "${args[@]}")
+              hist=$(jq -c '.data.repository.defaultBranchRef.target.history // {}' <<<"$resp")
+              commits=$((commits + $(jq '[.nodes[]?] | length' <<<"$hist")))
+              if [ "$is_fork" = "false" ]; then
+                adds=$((adds + $(jq '[.nodes[]?.additions] | add // 0' <<<"$hist")))
+                dels=$((dels + $(jq '[.nodes[]?.deletions] | add // 0' <<<"$hist")))
+              fi
+              if [ "$(jq -r '.pageInfo.hasNextPage // false' <<<"$hist")" != "true" ]; then
+                break
+              fi
+              cursor=$(jq -r '.pageInfo.endCursor' <<<"$hist")
+            done
+          done < <(jq -r '.[] | "\(.fork) \(.full_name)"' <<<"$repos_json")
+          # Uptime: years/months/days since account creation, calendar-aware.
+          read -r by bm bd <<<"$(date -u -d "$created" +%Y' '%m' '%d)"
+          read -r ty tm td <<<"$(date -u +%Y' '%m' '%d)"
+          by=$((10#$by)); bm=$((10#$bm)); bd=$((10#$bd))
+          ty=$((10#$ty)); tm=$((10#$tm)); td=$((10#$td))
+          years=$((ty - by))
+          months=$((tm - bm))
+          if ((tm < bm || (tm == bm && td < bd))); then
+            years=$((years - 1))
+            months=$((months + 12))
+          fi
+          if ((td < bd)); then
+            months=$((months - 1))
+            prev_year=$ty
+            prev_month=$((tm - 1))
+            if ((prev_month == 0)); then
+              prev_month=12
+              prev_year=$((ty - 1))
+            fi
+            prev_len=$(date -u -d "$prev_year-$prev_month-01 +1 month -1 day" +%d)
+            days=$((10#$prev_len - bd + td))
+          else
+            days=$((td - bd))
+          fi
+
+          pl() { [ "$1" -eq 1 ] && printf '%s' "$2" || printf '%ss' "$2"; }
+          commas() { printf '%s' "$1" | sed ':a; s/\B[0-9]\{3\}\b/,&/; ta'; }
+
+          if ((priv > 0)); then
+            repos_line="Repos: ${pub} (+${priv} Private)"
+          else
+            repos_line="Repos: ${total}"
+          fi
+
+          stats=$(printf '%s\n' \
+            "Commits: ${commits}" \
+            "$repos_line" \
+            "Lines of Code: $(commas "$((adds - dels))") ($(commas "$adds")++, $(commas "$dels")--)" \
+            "Uptime: $years $(pl "$years" year), $months $(pl "$months" month), $days $(pl "$days" day)")
+
+          awk -v repl="$stats" '
+            { line[NR] = $0 }
+            END {
+              for (i = 1; i < NR; i++) {
+                if (line[i] == "GitHub Stats" && line[i + 1] ~ /^-+$/) {
+                  for (j = 1; j <= i + 1; j++) print line[j]
+                  printf "%s\n", repl
+                  exit 0
+                }
+              }
+              print "GitHub Stats section missing from README" > "/dev/stderr"
+              exit 1
+            }
+          ' README > README.tmp
+          mv README.tmp README
+
+          echo "uptime=$years years $months months $days days repos=$total ($priv private) commits=$commits loc=$((adds - dels)) ($adds++ $dels--)"
+
+      - name: Commit refreshed README
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README; then
+            echo "README unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README
+          git commit -m "chore: refresh profile stats"
+          git push
