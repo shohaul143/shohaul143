@@ -1,7 +1,7 @@
 OS: Windows + Arch (WSL)
-IDE: Neovim, Zed, Cursor
-Tools: OMP, Postman, Docker, Jenkins, Figma
-Learning: Kubernetes, FastAPI, Apache Kafka
+IDE: Neovim, Helix
+Tools: OMP, Herdr, Sitch
+Learning: Svelte, Zig, Bun
 
 GitHub Stats
 ------------
